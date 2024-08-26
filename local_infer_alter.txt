@@ -1,0 +1,72 @@
+import numpy as np
+import torch
+import glob
+import json
+from model import load_tokenizer, load_model
+from fast_detect_gpt import get_sampling_discrepancy_analytic
+
+class ProbEstimator:
+    def __init__(self, ref_path):
+        self.real_crits = []
+        self.fake_crits = []
+        for result_file in glob.glob(os.path.join(ref_path, '*.json')):
+            with open(result_file, 'r') as fin:
+                res = json.load(fin)
+                self.real_crits.extend(res['predictions']['real'])
+                self.fake_crits.extend(res['predictions']['samples'])
+        print(f'ProbEstimator: total {len(self.real_crits) * 2} samples.')
+
+    def crit_to_prob(self, crit):
+        offset = np.sort(np.abs(np.array(self.real_crits + self.fake_crits) - crit))[100]
+        cnt_real = np.sum((np.array(self.real_crits) > crit - offset) & (np.array(self.real_crits) < crit + offset))
+        cnt_fake = np.sum((np.array(self.fake_crits) > crit - offset) & (np.array(self.fake_crits) < crit + offset))
+        return cnt_fake / (cnt_real + cnt_fake)
+
+class FastDetectGPT:
+    def __init__(self, scoring_model_name, reference_model_name, dataset, ref_path, device, cache_dir):
+        self.scoring_tokenizer = load_tokenizer(scoring_model_name, dataset, cache_dir)
+        self.scoring_model = load_model(scoring_model_name, device, cache_dir)
+        self.scoring_model.eval()
+
+        if reference_model_name != scoring_model_name:
+            self.reference_tokenizer = load_tokenizer(reference_model_name, dataset, cache_dir)
+            self.reference_model = load_model(reference_model_name, device, cache_dir)
+            self.reference_model.eval()
+        else:
+            self.reference_tokenizer = self.scoring_tokenizer
+            self.reference_model = self.scoring_model
+
+        self.prob_estimator = ProbEstimator(ref_path)
+        self.criterion_fn = get_sampling_discrepancy_analytic
+        self.device = device
+
+    def predict(self, text):
+        tokenized = self.scoring_tokenizer(text, truncation=True, return_tensors="pt", padding=True, return_token_type_ids=False).to(self.device)
+        labels = tokenized.input_ids[:, 1:]
+        with torch.no_grad():
+            logits_score = self.scoring_model(**tokenized).logits[:, :-1]
+            if self.reference_model_name == self.scoring_model_name:
+                logits_ref = logits_score
+            else:
+                tokenized_ref = self.reference_tokenizer(text, truncation=True, return_tensors="pt", padding=True, return_token_type_ids=False).to(self.device)
+                assert torch.all(tokenized_ref.input_ids[:, 1:] == labels), "Tokenizer is mismatch."
+                logits_ref = self.reference_model(**tokenized_ref).logits[:, :-1]
+            crit = self.criterion_fn(logits_ref, logits_score, labels)
+            prob = self.prob_estimator.crit_to_prob(crit)
+        return crit, prob
+
+# Example usage
+if __name__ == '__main__':
+    # Configuration
+    scoring_model_name = "gpt-neo-2.7B"
+    reference_model_name = "gpt-neo-2.7B"
+    dataset = "xsum"
+    ref_path = "./local_infer_ref"
+    device = "cuda"
+    cache_dir = "../cache"
+
+    # Initialize and predict
+    detector = FastDetectGPT(scoring_model_name, reference_model_name, dataset, ref_path, device, cache_dir)
+    text = "Your input text here"
+    criterion, probability = detector.predict(text)
+    print(f"Criterion: {criterion}, Probability of being machine-generated: {probability * 100:.2f}%")
